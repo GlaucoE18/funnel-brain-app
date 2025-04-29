@@ -1,7 +1,6 @@
 import streamlit as st
 import tempfile
 import os
-from dotenv import load_dotenv
 from supabase import create_client
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain.document_loaders import PyPDFLoader
@@ -9,9 +8,6 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.vectorstores import SupabaseVectorStore
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
-
-# Carrega variáveis de ambiente
-load_dotenv()
 
 # Configurações
 st.set_page_config(
