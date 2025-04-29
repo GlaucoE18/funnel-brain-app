@@ -1,5 +1,13 @@
 import streamlit as st
-import openai
+import tempfile
+import os
+import time
+from openai import OpenAI
+from supabase import create_client
+import pypdf
+import uuid
+from langchain_openai import OpenAIEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # Configuração da página
 st.set_page_config(
@@ -9,7 +17,19 @@ st.set_page_config(
 )
 
 # Inicialização da API OpenAI
-openai.api_key = st.secrets["OPENAI_API_KEY"]
+openai_api_key = st.secrets["OPENAI_API_KEY"]
+client = OpenAI(api_key=openai_api_key)
+
+# Inicialização do Supabase
+supabase_url = st.secrets["SUPABASE_URL"]
+supabase_key = st.secrets["SUPABASE_KEY"]
+supabase = create_client(supabase_url, supabase_key)
+
+# Configuração do OpenAI Embeddings
+embeddings = OpenAIEmbeddings(
+    model="text-embedding-3-small",
+    openai_api_key=openai_api_key
+)
 
 # Definição do sistema base de prompts
 SYSTEM_PROMPT = """
@@ -20,6 +40,24 @@ Você foi criado por Glauco, um especialista em funis de vendas que está se pos
 Seja específico, estratégico e utilize os princípios de Brevidade Inteligente: comunicação clara, direta e valiosa.
 
 Use um tom consultivo profissional, direto e preciso, evitando linguagem genérica ou "coachzística".
+"""
+
+KNOWLEDGE_PROMPT = """
+Você é o Funnel Mastermind AI, um especialista em funis de vendas, copywriting e marketing digital.
+
+Você foi criado por Glauco, um especialista em funis de vendas que está se posicionando como autoridade em funis perpétuos.
+
+Responda à pergunta do usuário usando apenas as informações fornecidas no CONTEXTO abaixo. Se a resposta não estiver contida no CONTEXTO, diga que você não tem essa informação específica na sua base de conhecimento.
+
+Seja específico, estratégico e utilize os princípios de Brevidade Inteligente: comunicação clara, direta e valiosa.
+
+Use um tom consultivo profissional, direto e preciso, evitando linguagem genérica ou "coachzística".
+
+CONTEXTO:
+{context}
+
+PERGUNTA:
+{question}
 """
 
 FUNNEL_ANALYSIS_PROMPT = """
@@ -49,10 +87,135 @@ Público-alvo: {audience}
 Objetivo do e-mail: {objective}
 """
 
+# Função para extrair texto de PDFs
+def extract_text_from_pdf(pdf_file):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+        temp_file.write(pdf_file.read())
+        temp_file_path = temp_file.name
+    
+    try:
+        # Abre o PDF e extrai o texto
+        reader = pypdf.PdfReader(temp_file_path)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n"
+        
+        return text
+    except Exception as e:
+        st.error(f"Erro ao processar PDF: {str(e)}")
+        return None
+    finally:
+        # Remove o arquivo temporário
+        os.unlink(temp_file_path)
+
+# Função para dividir texto em chunks
+def split_text(text):
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+        length_function=len
+    )
+    return text_splitter.split_text(text)
+
+# Função para criar embeddings e armazenar no Supabase
+def store_embeddings(chunks, metadata):
+    # Criar tabela se não existir
+    supabase.table("funnel_documents").select("*").limit(1).execute()
+    
+    # Armazenar cada chunk
+    for i, chunk in enumerate(chunks):
+        # Gerar embedding via OpenAI
+        response = client.embeddings.create(
+            input=chunk,
+            model="text-embedding-3-small"
+        )
+        embedding = response.data[0].embedding
+        
+        # Preparar metadados completos
+        full_metadata = metadata.copy()
+        full_metadata["chunk_index"] = i
+        
+        # Armazenar no Supabase
+        supabase.table("funnel_documents").insert({
+            "id": str(uuid.uuid4()),
+            "content": chunk,
+            "embedding": embedding,
+            "metadata": full_metadata
+        }).execute()
+    
+    return len(chunks)
+
+# Função para buscar informações relevantes no Supabase
+def search_knowledge_base(query, top_k=5):
+    # Gerar embedding para a consulta
+    response = client.embeddings.create(
+        input=query,
+        model="text-embedding-3-small"
+    )
+    query_embedding = response.data[0].embedding
+    
+    # Buscar documentos similares via função match_documents
+    result = supabase.rpc(
+        "match_documents", 
+        {"query_embedding": query_embedding, "match_count": top_k}
+    ).execute()
+    
+    if not result.data:
+        return []
+    
+    # Formatar resultado
+    contexts = []
+    for item in result.data:
+        contexts.append({
+            "content": item["content"],
+            "metadata": item["metadata"],
+            "similarity": item["similarity"]
+        })
+    
+    return contexts
+
+# Função para consultar o modelo com base de conhecimento
+def ask_with_knowledge(question):
+    # Buscar informações relevantes
+    contexts = search_knowledge_base(question)
+    
+    if not contexts:
+        # Se não encontrar nada, use o prompt padrão
+        return ask_gpt(question)
+    
+    # Preparar contexto para o prompt
+    context_text = "\n\n---\n\n".join([c["content"] for c in contexts])
+    
+    # Consultar o modelo com o contexto
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": KNOWLEDGE_PROMPT.format(context=context_text, question=question)},
+        ],
+        temperature=0.7,
+    )
+    
+    answer = response.choices[0].message.content
+    
+    # Adicionar fontes
+    sources = []
+    for context in contexts:
+        if "title" in context["metadata"]:
+            source = context["metadata"]["title"]
+            if source not in sources:
+                sources.append(source)
+    
+    if sources:
+        answer += "\n\n**Fontes:**\n"
+        for source in sources:
+            answer += f"- {source}\n"
+    
+    return answer
+
 # Função para consultar o modelo GPT-4o
 def ask_gpt(prompt, system_prompt=SYSTEM_PROMPT):
     try:
-        response = openai.chat.completions.create(
+        response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -82,15 +245,10 @@ def create_email(offer, audience, objective):
 st.title("🧠 Funnel Mastermind AI")
 st.subheader("Seu assistente pessoal para funis de vendas, copywriting e marketing digital")
 
-# Aviso sobre a versão
-st.info(
-    "Esta é uma versão inicial da Funnel Mastermind AI. " +
-    "A funcionalidade de upload de documentos e base de conhecimento personalizada será implementada em breve."
-)
-
 # Criação das abas
-tab1, tab2, tab3 = st.tabs([
+tab1, tab2, tab3, tab4 = st.tabs([
     "💬 Chat com o Assistente", 
+    "📂 Upload de Documentos",
     "🔍 Análise de Funis",
     "✉️ Criação de E-mails"
 ])
@@ -123,7 +281,10 @@ with tab1:
             message_placeholder.markdown("Pensando...")
             
             # Obtém resposta da OpenAI
-            response = ask_gpt(prompt)
+            if "has_documents" in st.session_state and st.session_state.has_documents:
+                response = ask_with_knowledge(prompt)
+            else:
+                response = ask_gpt(prompt)
             
             # Atualiza placeholder com resposta
             message_placeholder.markdown(response)
@@ -131,8 +292,90 @@ with tab1:
             # Adiciona resposta ao histórico
             st.session_state.messages.append({"role": "assistant", "content": response})
 
-# Tab 2: Análise de Funis
+# Tab 2: Upload de Documentos
 with tab2:
+    st.header("Adicione documentos à base de conhecimento")
+    
+    with st.form("upload_form", clear_on_submit=True):
+        uploaded_file = st.file_uploader("Selecione um arquivo PDF", type=["pdf"])
+        title = st.text_input("Título do documento", placeholder="Ex: Expert Secrets - Russell Brunson")
+        author = st.text_input("Autor (opcional)", placeholder="Ex: Russell Brunson")
+        category = st.text_input("Categoria (opcional)", placeholder="Ex: Copywriting, Funis, Email Marketing")
+        
+        submit_button = st.form_submit_button("Fazer Upload")
+        
+        if submit_button and uploaded_file is not None:
+            with st.spinner("Processando documento..."):
+                try:
+                    # Extrai texto do PDF
+                    text = extract_text_from_pdf(uploaded_file)
+                    
+                    if text:
+                        # Divide em chunks
+                        chunks = split_text(text)
+                        
+                        # Prepara metadados
+                        metadata = {
+                            "title": title,
+                            "filename": uploaded_file.name
+                        }
+                        
+                        if author:
+                            metadata["author"] = author
+                        
+                        if category:
+                            metadata["category"] = category
+                        
+                        # Armazena no Supabase
+                        chunk_count = store_embeddings(chunks, metadata)
+                        
+                        # Marca que temos documentos
+                        st.session_state.has_documents = True
+                        
+                        st.success(f"Documento '{title}' processado com sucesso! Foram criados {chunk_count} fragmentos de conhecimento.")
+                    else:
+                        st.error("Não foi possível extrair texto do documento.")
+                
+                except Exception as e:
+                    st.error(f"Erro ao processar documento: {str(e)}")
+    
+    # Exibe documentos na base de conhecimento
+    st.subheader("Documentos na base de conhecimento")
+    
+    try:
+        result = supabase.table("funnel_documents").select("metadata").execute()
+        
+        if result.data:
+            # Organiza documentos únicos por título
+            documents = {}
+            for item in result.data:
+                if "metadata" in item and "title" in item["metadata"]:
+                    title = item["metadata"]["title"]
+                    if title not in documents:
+                        documents[title] = item["metadata"]
+            
+            # Exibe lista de documentos
+            if documents:
+                st.write(f"Total de documentos: {len(documents)}")
+                for title, metadata in documents.items():
+                    author = metadata.get("author", "")
+                    category = metadata.get("category", "")
+                    info = f"**{title}**"
+                    if author:
+                        info += f" | Autor: {author}"
+                    if category:
+                        info += f" | Categoria: {category}"
+                    st.markdown(info)
+            else:
+                st.info("Nenhum documento encontrado na base de conhecimento.")
+        else:
+            st.info("Nenhum documento encontrado na base de conhecimento.")
+    
+    except Exception as e:
+        st.error(f"Erro ao carregar documentos: {str(e)}")
+
+# Tab 3: Análise de Funis
+with tab3:
     st.header("Analise um funil de vendas")
     
     description = st.text_area(
@@ -149,8 +392,8 @@ with tab2:
         else:
             st.warning("Por favor, forneça uma descrição do funil para análise.")
 
-# Tab 3: Criação de E-mails
-with tab3:
+# Tab 4: Criação de E-mails
+with tab4:
     st.header("Crie e-mails com o framework F4")
     
     with st.form("email_form"):
@@ -175,6 +418,19 @@ with tab3:
                     )
             else:
                 st.warning("Por favor, preencha todos os campos.")
+
+# Verifica se existem documentos
+@st.cache_data(ttl=300)
+def check_documents():
+    try:
+        result = supabase.table("funnel_documents").select("id").limit(1).execute()
+        return len(result.data) > 0
+    except:
+        return False
+
+# Atualiza o estado da sessão
+if "has_documents" not in st.session_state:
+    st.session_state.has_documents = check_documents()
 
 # Rodapé
 st.markdown("---")
