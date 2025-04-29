@@ -1,48 +1,28 @@
 import streamlit as st
-import tempfile
-import os
-from supabase import create_client
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import SupabaseVectorStore
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
+import openai
 
-# Configurações
+# Configuração da página
 st.set_page_config(
     page_title="Funnel Mastermind AI",
     page_icon="🧠",
     layout="wide"
 )
 
-# Templates de prompts
-QA_PROMPT = """
+# Inicialização da API OpenAI
+openai.api_key = st.secrets["OPENAI_API_KEY"]
+
+# Definição do sistema base de prompts
+SYSTEM_PROMPT = """
 Você é o Funnel Mastermind AI, um especialista em funis de vendas, copywriting e marketing digital.
 
 Você foi criado por Glauco, um especialista em funis de vendas que está se posicionando como autoridade em funis perpétuos.
 
-Seu conhecimento vem apenas de documentos específicos sobre marketing, funis e copywriting que você tem acesso.
-
-Você deve responder às perguntas consultando apenas o contexto fornecido abaixo, sem usar conhecimento externo.
-
 Seja específico, estratégico e utilize os princípios de Brevidade Inteligente: comunicação clara, direta e valiosa.
 
-Se a resposta não estiver no contexto, diga que não tem essa informação específica no seu banco de conhecimento, mas pode ajudar com perguntas relacionadas a marketing e funis.
-
 Use um tom consultivo profissional, direto e preciso, evitando linguagem genérica ou "coachzística".
-
-Contexto:
-{context}
-
-Pergunta: {query}
-
-Resposta:
 """
 
 FUNNEL_ANALYSIS_PROMPT = """
-Você é o Funnel Mastermind AI, um especialista em funis de vendas.
-
 Analise o funil descrito abaixo com base no seu conhecimento especializado. Avalie:
 
 1. Estrutura do funil (Tipo de funil, fases, componentes)
@@ -50,17 +30,10 @@ Analise o funil descrito abaixo com base no seu conhecimento especializado. Aval
 3. Estratégias de otimização recomendadas
 4. Métricas que devem ser monitoradas
 
-Use exemplos e referências do seu banco de conhecimento quando aplicável.
-
 Descrição do funil:
-{funnel_description}
-
-Análise:
 """
 
 EMAIL_F4_PROMPT = """
-Você é o Funnel Mastermind AI, um especialista em copywriting e e-mail marketing.
-
 Crie um e-mail seguindo o framework F4 (Seinfeld + Brevidade Inteligente) com:
 
 1. Assunto magnetizante que gera curiosidade
@@ -74,126 +47,27 @@ O e-mail deve parecer pessoal, criar conexão, ter elementos de storytelling e s
 Produto/Oferta: {offer}
 Público-alvo: {audience}
 Objetivo do e-mail: {objective}
-
-E-mail:
 """
 
-# Inicialização da conexão com Supabase e OpenAI
-@st.cache_resource
-def init_resources():
-    # Conexão com Supabase
-    supabase_url = st.secrets["SUPABASE_URL"]
-    supabase_key = st.secrets["SUPABASE_KEY"]
-    supabase_client = create_client(supabase_url, supabase_key)
-    
-    # Configuração do OpenAI
-    openai_api_key = st.secrets["OPENAI_API_KEY"]
-    embeddings = OpenAIEmbeddings(
-        model="text-embedding-3-small",
-        openai_api_key=openai_api_key
-    )
-    
-    # Vector Store
-    vector_store = SupabaseVectorStore(
-        client=supabase_client,
-        embedding=embeddings,
-        table_name="funnel_documents",
-        query_name="match_documents"
-    )
-    
-    # LLM
-    llm = ChatOpenAI(
-        model="gpt-4o",
-        temperature=0.1,
-        openai_api_key=openai_api_key
-    )
-    
-    # QA Chain
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=vector_store.as_retriever(
-            search_kwargs={"k": 5}
-        ),
-        chain_type_kwargs={
-            "prompt": PromptTemplate.from_template(QA_PROMPT)
-        },
-        return_source_documents=True
-    )
-    
-    return {
-        "supabase_client": supabase_client,
-        "embeddings": embeddings,
-        "vector_store": vector_store,
-        "llm": llm,
-        "qa_chain": qa_chain
-    }
-
-# Inicializa recursos
-try:
-    resources = init_resources()
-except Exception as e:
-    st.error(f"Erro ao inicializar recursos: {str(e)}")
-    st.stop()
-
-# Função para processar documentos
-def process_document(file, metadata=None):
-    if metadata is None:
-        metadata = {}
-    
-    # Cria arquivo temporário
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
-        temp_file.write(file.read())
-        temp_file_path = temp_file.name
-    
+# Função para consultar o modelo GPT-4o
+def ask_gpt(prompt, system_prompt=SYSTEM_PROMPT):
     try:
-        # Carrega PDF
-        loader = PyPDFLoader(temp_file_path)
-        documents = loader.load()
-        
-        # Adiciona metadados
-        for doc in documents:
-            doc.metadata.update(metadata)
-        
-        # Divide em chunks
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200
+        response = openai.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
         )
-        chunks = text_splitter.split_documents(documents)
-        
-        # Adiciona ao vector store
-        resources["vector_store"].add_documents(chunks)
-        
-        return {
-            "success": True,
-            "document_count": len(documents),
-            "chunk_count": len(chunks),
-            "metadata": metadata
-        }
-    
+        return response.choices[0].message.content
     except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
-    
-    finally:
-        # Remove arquivo temporário
-        os.unlink(temp_file_path)
-
-# Função para fazer perguntas
-def ask_question(question):
-    response = resources["qa_chain"]({"query": question})
-    return {
-        "answer": response["result"],
-        "sources": [doc.metadata for doc in response["source_documents"]]
-    }
+        return f"Erro ao processar: {str(e)}"
 
 # Função para analisar funis
 def analyze_funnel(description):
-    prompt = FUNNEL_ANALYSIS_PROMPT.format(funnel_description=description)
-    return ask_question(prompt)
+    full_prompt = FUNNEL_ANALYSIS_PROMPT + description
+    return ask_gpt(full_prompt)
 
 # Função para criar e-mails
 def create_email(offer, audience, objective):
@@ -202,17 +76,22 @@ def create_email(offer, audience, objective):
         audience=audience,
         objective=objective
     )
-    return ask_question(prompt)
+    return ask_gpt(prompt)
 
 # Cabeçalho
 st.title("🧠 Funnel Mastermind AI")
 st.subheader("Seu assistente pessoal para funis de vendas, copywriting e marketing digital")
 
+# Aviso sobre a versão
+st.info(
+    "Esta é uma versão inicial da Funnel Mastermind AI. " +
+    "A funcionalidade de upload de documentos e base de conhecimento personalizada será implementada em breve."
+)
+
 # Criação das abas
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3 = st.tabs([
     "💬 Chat com o Assistente", 
-    "📂 Upload de Documentos", 
-    "🔍 Analise de Funis",
+    "🔍 Análise de Funis",
     "✉️ Criação de E-mails"
 ])
 
@@ -243,67 +122,17 @@ with tab1:
             message_placeholder = st.empty()
             message_placeholder.markdown("Pensando...")
             
-            # Obtém resposta
-            try:
-                response = ask_question(prompt)
-                answer = response["answer"]
-                
-                # Exibe fontes se existirem
-                if "sources" in response and response["sources"]:
-                    answer += "\n\n**Fontes:**\n"
-                    for source in response["sources"]:
-                        if "title" in source:
-                            answer += f"- {source['title']}\n"
-                
-                # Atualiza placeholder com resposta
-                message_placeholder.markdown(answer)
-                
-                # Adiciona resposta ao histórico
-                st.session_state.messages.append({"role": "assistant", "content": answer})
-                
-            except Exception as e:
-                message_placeholder.markdown(f"Erro ao processar sua pergunta. Por favor, tente novamente. Detalhes: {str(e)}")
+            # Obtém resposta da OpenAI
+            response = ask_gpt(prompt)
+            
+            # Atualiza placeholder com resposta
+            message_placeholder.markdown(response)
+            
+            # Adiciona resposta ao histórico
+            st.session_state.messages.append({"role": "assistant", "content": response})
 
-# Tab 2: Upload de Documentos
+# Tab 2: Análise de Funis
 with tab2:
-    st.header("Adicione documentos à base de conhecimento")
-    
-    with st.form("upload_form", clear_on_submit=True):
-        uploaded_file = st.file_uploader("Selecione um arquivo PDF", type=["pdf"])
-        title = st.text_input("Título do documento", placeholder="Ex: Expert Secrets - Russell Brunson")
-        author = st.text_input("Autor (opcional)", placeholder="Ex: Russell Brunson")
-        category = st.text_input("Categoria (opcional)", placeholder="Ex: Copywriting, Funis, Email Marketing")
-        
-        submit_button = st.form_submit_button("Fazer Upload")
-        
-        if submit_button and uploaded_file is not None:
-            with st.spinner("Processando documento..."):
-                try:
-                    # Prepara metadados
-                    metadata = {
-                        "title": title,
-                        "filename": uploaded_file.name
-                    }
-                    
-                    if author:
-                        metadata["author"] = author
-                    
-                    if category:
-                        metadata["category"] = category
-                    
-                    # Processa o documento
-                    result = process_document(uploaded_file, metadata)
-                    
-                    if result.get("success", False):
-                        st.success(f"Documento '{title}' processado com sucesso! Foram criados {result['chunk_count']} fragmentos de conhecimento.")
-                    else:
-                        st.error(f"Erro ao processar documento: {result.get('error', 'Erro desconhecido')}")
-                
-                except Exception as e:
-                    st.error(f"Erro ao fazer upload: {str(e)}")
-
-# Tab 3: Análise de Funis
-with tab3:
     st.header("Analise um funil de vendas")
     
     description = st.text_area(
@@ -315,24 +144,13 @@ with tab3:
     if st.button("Analisar Funil"):
         if description:
             with st.spinner("Analisando seu funil..."):
-                try:
-                    result = analyze_funnel(description)
-                    st.markdown(result["answer"])
-                    
-                    # Exibe fontes se existirem
-                    if "sources" in result and result["sources"]:
-                        st.subheader("Fontes de conhecimento utilizadas:")
-                        for source in result["sources"]:
-                            if "title" in source:
-                                st.write(f"- {source['title']}")
-                
-                except Exception as e:
-                    st.error(f"Erro ao analisar funil: {str(e)}")
+                result = analyze_funnel(description)
+                st.markdown(result)
         else:
             st.warning("Por favor, forneça uma descrição do funil para análise.")
 
-# Tab 4: Criação de E-mails
-with tab4:
+# Tab 3: Criação de E-mails
+with tab3:
     st.header("Crie e-mails com o framework F4")
     
     with st.form("email_form"):
@@ -345,20 +163,16 @@ with tab4:
         if submit_email:
             if offer and audience and objective:
                 with st.spinner("Criando seu e-mail..."):
-                    try:
-                        result = create_email(offer, audience, objective)
-                        st.markdown(result["answer"])
-                        
-                        # Adiciona botão para copiar
-                        st.download_button(
-                            label="Baixar E-mail",
-                            data=result["answer"],
-                            file_name="email_f4.txt",
-                            mime="text/plain"
-                        )
+                    result = create_email(offer, audience, objective)
+                    st.markdown(result)
                     
-                    except Exception as e:
-                        st.error(f"Erro ao criar e-mail: {str(e)}")
+                    # Adiciona botão para copiar
+                    st.download_button(
+                        label="Baixar E-mail",
+                        data=result,
+                        file_name="email_f4.txt",
+                        mime="text/plain"
+                    )
             else:
                 st.warning("Por favor, preencha todos os campos.")
 
